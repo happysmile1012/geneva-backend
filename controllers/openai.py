@@ -683,7 +683,7 @@ def ask():
     history = data.get("history")
     question = data.get("question")
 
-    valid = check_valid(user_id)
+    # valid = check_valid(user_id)
 
     # if valid == False:
     #     return jsonify({"level": "subscribe"})
