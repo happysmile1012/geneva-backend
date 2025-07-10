@@ -204,7 +204,7 @@ def grok_generate(history, prompt, question):
     })
 
     return grok_client.chat.completions.create(
-        model="grok-3-fast-latest",
+        model="grok-4-latest",
         messages=messages
     ).choices[0].message.content
 
@@ -691,7 +691,7 @@ def ask():
     # if not question:
     #     return jsonify({"error": "Question is required"}), 400
 
-
+    # return jsonify({"level": "subscribe"})
     prompt = f"""
 
     You are a knowledgeable and objective AI assistant. Your task is to generate a clear, accurate, and helpful answer based solely on your understanding of the topic.
