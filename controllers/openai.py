@@ -273,14 +273,16 @@ def summarize_opinion(responses, mode):
         return "All models failed to answer."
     if mode == "consensus":
         summary_prompt = """Given the answers from different AI models, provide a structured comparison including:
-        - Key points of agreement
-        - Notable differences
-        - Any unique insights provided by individual models
-        - Present the output in a clear and organized format using bullet points or numbered sections without any tables. The answer can't be empty.
-        - And You have to include the model name and version I provided when you answer.
-            The models should be inside brackets like this: (Gemini 2.5 Pro, Mistral Large, Llama4).
-        for example:
-            > All models (Gemini 2.5 Pro, Mistral Large, Llama4) agreed that...
+
+        Key points of agreement
+
+        Notable differences
+
+        Any unique insights provided by individual models
+        
+        Present the output in a clear and organized format using bullet points or numbered sections without any tables. The answer can't be empty.
+        
+        And You have to include the model name and version I provided when you answer .
         """
     if mode == "blaze":
         summary_prompt = """
