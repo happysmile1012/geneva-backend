@@ -81,43 +81,33 @@ async def get_gpt4o_answer(history, prompt, question):
         return {"model": "GPT-4.1", "answer": "", "status": "failed"}
 
 # Generate answer using Claude (Anthropic)
-def claude_generate(history, prompt, question):
+def claude_generate(history, question):
     messages = []
     for element in history:
         if element['type'] == 'question':
             messages.append({"role": "user", "content": element["text"]})
-        if element['type'] == 'answer':
+        elif element['type'] == 'answer':
             messages.append({"role": "assistant", "content": element["text"]})
 
-    messages.append({
-        "role": "user",
-        "content": question
-    })
+    # Append the new user question
+    messages.append({"role": "user", "content": question})
 
     full_response = ""
-    stop_reason = None
 
-    while True:
-        response = anthropic_client.messages.create(
-            model='claude-opus-4-20250514',
-            max_tokens=1024,
-            messages=messages
-        )
-
-        chunk_text = response.content[0].text
-        stop_reason = response.stop_reason
-
-        full_response += chunk_text
-
-        if stop_reason != "max_tokens":
-            break
-
-        # Append current response to context and ask it to continue
-        messages.append({"role": "assistant", "content": chunk_text})
-        messages.append({"role": "user", "content": "Please continue."})
+    # Use streaming API
+    with anthropic_client.messages.stream(
+        model="claude-3-5-sonnet-20240620",  # or "claude-opus-4-20250514"
+        max_tokens=4096,   # set generously
+        messages=messages
+    ) as stream:
+        for event in stream:
+            if event.type == "content_block_delta":
+                # Append incremental text
+                full_response += event.delta
+            elif event.type == "message_stop":
+                break
 
     return full_response
-
 async def get_claude_answer(history, prompt, question):
     print('start claude', int(time.time()))
     try:
@@ -280,44 +270,43 @@ def summarize_opinion(responses, mode):
         return "All models failed to answer."
     if mode == "consensus":
         summary_prompt = """You will be given answers from different AI models. 
-Provide a **Structured Comparison of AI Model Responses** with the following format:
+Provide a **Structured Comparison of AI Model Responses From Different Models** with the following format:
 
-### Structured Comparison of AI Model Responses
+Structured Comparison of AI Model Responses
 
-**Key Points of Agreement**
+### Key Points of Agreement
 - Clearly state what specific models (by name/version) agreed on. Example: "GPT-4.1 and Claude Opus 4 agree that X."
 - If more than two models agree, say: "GPT-4.1, Claude Opus 4, and Gemini 2.5 Pro all agree that Y."
 
-**Notable Differences**
+### Notable Differences
 - Explicitly mention which model(s) gave a different perspective. Example: "Mistral Large emphasized..., while Grok 4 focused on..."
 
-**Unique Insights**
-- If any single model added information not covered by others, mention the model and summarize that contribution.
+### Unique Insights By Model
+Provide unique insights grouped under subheadings for each model.
+
+**{Model Name Version}**:
+- Summarize the unique insights only this model contributed.
+
+---
+
+### Final Observations
+- before last section, please add divider line
+**Consensus**:
+- Summarize the strongest areas where models clearly aligned.
+
+**Divergence**:
+- Summarize the most significant disagreements or contrasting emphases.
+
+**Skepticism vs Advocacy**:
+- Highlight where models showed cautious reasoning (skepticism) vs confident promotion (advocacy).
 
 Rules:
-- Always include the section title exactly as shown above.
+- Always include the section titles exactly as shown above.
 - Always attribute points to the correct models by their name/version as provided in the input.
 - Do not merge everything into a generic summary without attribution.
 - Never leave a section empty; if nothing fits, write "None noted."
 """
-    elif mode == "blaze":
-        summary_prompt = """
-> You will be given answers from several AI models. Summarize their collective reasoning as follows:
-> 1) Begin with “The models agree that …” once, then list shared points.
-> 2) Refer to individual models as “Model 1”, “Model 2”, etc. (do NOT use actual model names).
-> 3) Use numbered sections or bullet points (no tables).
-> 4) Do NOT mention unique insights or notable differences.
-> 5) Do NOT use “both”; say “Model 1 and Model 2” or “all models”.
-> 6) Ensure the response is never empty.
-> 7) After the first sentence, don’t repeat “The models agree that …”; just list the content.
-"""
-    else:
-        # Fallback to consensus rules if an unknown mode sneaks in
-        summary_prompt = """Provide a concise, structured comparison:
-- Agreements
-- Differences
-- Unique insights
-Use bullets, no tables, and include model names as provided."""
+
 
 
     print("-----------------SUMMARY PROMPT------------------", int(time.time()))
@@ -340,7 +329,7 @@ Use bullets, no tables, and include model names as provided."""
             {"role": "user", "content": content}
         ],
         temperature=0.2,
-        max_tokens=800,
+        max_tokens=4000,
     )
     print("-----------------SUMMARY ANSWERED------------------", int(time.time()))
     return (llm.choices[0].message.content or "").strip()
@@ -361,6 +350,8 @@ Use bullets, no tables, and include model names as provided."""
 async def get_opinion(responses, mode):
     try:
         answer = await asyncio.to_thread(summarize_opinion, responses, mode)
+        print("-----------------SUMMARY ANSWERED------------------", int(time.time()))
+        print(answer)
         return answer
     except Exception as e:
         raise RuntimeError(f"Summarizing failed: {str(e)}")
@@ -372,7 +363,6 @@ def pick_best_answer(responses):
     # valid_answers = [res for res in responses if res["status"] == "success"]
     # if len(valid_answers) < 2:
     #     return valid_answers[0]["answer"] if valid_answers else "No valid answers."
-
     # prompt = f"""
     # Multiple answers are provided for the same question, generated by different AI models.
 
@@ -402,16 +392,36 @@ def pick_best_answer(responses):
         return "**Consensus:**\n" + valid_answers[0]["answer"]
 
     ranking_prompt = """
-Multiple answers were generated for the same user question by different AI models.
+You are given multiple answers to the same user question, generated by different AI models.
+Your task is to evaluate, synthesize, and produce the single best final answer.
 
-Choose the single best answer according to these criteria (in order):
-1) Factual accuracy and absence of hallucinations
-2) Clarity and completeness (covers likely follow-ups)
-3) Actionable structure (steps, bullets) where appropriate
-4) Conciseness without omitting key details
+Follow these instructions carefully:
 
-Output ONLY the selected answer text. Do NOT add any commentary, rankings, or explanation.
+1. **Evaluate all candidate answers** against the following criteria (in order of importance):
+   - Factual Accuracy: Verify that information is correct, consistent, and free from hallucinations.
+   - Clarity and Completeness: Prefer answers that explain concepts thoroughly, cover likely follow-up questions, and avoid ambiguity.
+   - Actionable Structure: Reward answers that use bullet points, numbered steps, or clear formatting for readability.
+   - Conciseness with Depth: Provide enough detail to be comprehensive, while avoiding unnecessary repetition or filler.
+
+2. **Cross-check between answers**:
+   - If several answers agree, reinforce that information as reliable.
+   - If answers conflict, analyze which is more plausible or evidence-based, and resolve the conflict in your output.
+   - If one answer provides unique but useful detail not found in others, include it.
+
+3. **Generate a final answer** that:
+   - Is longer, detailed, and well-structured (minimum several paragraphs, or a mix of paragraphs and bullet points).
+   - Combines the strongest elements from all candidate answers.
+   - Improves clarity, correctness, and usability compared to any single answer.
+   - Reads as if written by an expert human, not as a stitched summary.
+
+4. **STRICT OUTPUT REQUIREMENTS**
+   - Output ONLY the final synthesized answer.
+   - Do NOT output commentary, rankings, meta-analysis, or references to "Answer 1 / Answer 2".
+   - The final output must stand alone as the best possible answer.
+
+Your goal: Deliver the single most accurate, comprehensive, and helpful response possible, leveraging and improving upon all the given answers.
 """
+
 
     content = ranking_prompt + "\n\n"
     for i, res in enumerate(valid_answers, start=1):
@@ -425,7 +435,7 @@ Output ONLY the selected answer text. Do NOT add any commentary, rankings, or ex
             {"role": "user", "content": content}
         ],
         temperature=0.1,
-        max_tokens=1200,
+        max_tokens=4000,
     )
 
     chosen = (llm.choices[0].message.content or "").strip()
