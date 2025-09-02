@@ -21,6 +21,8 @@ from models.transactions import Transactions
 from datetime import datetime, timedelta
 import random
 import time
+from collections import OrderedDict
+from itertools import chain
 
 
 load_dotenv()
@@ -509,6 +511,112 @@ def generate_answers(mode, level, history, prompt, question):
     print("-------------END_Answers-------------", int(time.time()))
     return results
 
+def _fallback_image_keywords_from_text(text: str):
+    terms = extract_key_terms(text or "") or ["overview", "context", "details"]
+    top_mods = ["overview", "real world", "context", "landscape", "scene",
+                "wide", "example", "interface", "architecture", "in practice"]
+    bottom_mods = ["close up", "diagram", "workflow", "comparison", "steps",
+                   "how to", "setup", "configuration", "metrics", "results"]
+
+    def expand(mods):
+        out = []
+        for m in mods:
+            for t in terms:
+                out.append(f"{t} {m}".strip())
+        return out
+
+    top_keywords = (expand(top_mods) or top_mods)[:30]
+    bottom_keywords = (expand(bottom_mods) or bottom_mods)[:30]
+    if len(top_keywords) < 10: top_keywords = (top_keywords * ((10 // max(1, len(top_keywords))) + 1))[:10]
+    if len(bottom_keywords) < 10: bottom_keywords = (bottom_keywords * ((10 // max(1, len(bottom_keywords))) + 1))[:10]
+    return top_keywords[:30], bottom_keywords[:30]
+
+#Generate image keywords
+def get_image_keywords_from_responses(responses):
+    """
+    Input: same as pick_best_answer(responses) -> list of {model, answer, status, ...}
+    Output: (top_keywords, bottom_keywords)  # each >= 10 strings
+    Uses Together Llama. Deterministic fallback if JSON invalid or short.
+    """
+    print("---------------IMAGE KEYWORDS---------------", int(time.time()))
+    valid_answers = [res for res in responses if res.get("status") == "success" and (res.get("answer") or "").strip()]
+    if not valid_answers:
+        return _fallback_image_keywords_from_text("")
+
+    parts = []
+    for i, res in enumerate(valid_answers, start=1):
+        parts.append(f"Answer {i}:\n{res['answer'].strip()}\n")
+    bundle = "\n".join(parts)
+
+    prompt = f"""
+You will receive multiple ANSWERS to the same question.
+
+Task:
+1) Skim the answers and anchor on the strongest/clearest content.
+2) Produce STRICT JSON ONLY in this exact shape:
+   {{"top_keywords": ["..."], "bottom_keywords": ["..."]}}
+
+Rules:
+- Each array MUST contain AT LEAST 5 concise queries (3-6 words each).
+- Queries must be tightly related to the anchored answer's concrete entities (names, models, orgs, places, versions, dates if helpful).
+- "top_keywords" = hero/context image queries (wide/scene/overview).
+- "bottom_keywords" = detail/diagram/comparison/workflow image queries.
+- Avoid generic words like "image", "photo", "picture", "wallpaper".
+- No explanations, no extra text — JSON only.
+
+ANSWERS:
+{bundle}
+""".strip()
+
+    try:
+        resp = together_client.chat.completions.create(
+            model="meta-llama/Llama-4-Maverick-17B-128E-Instruct-FP8",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+            max_tokens=900,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        i, j = raw.find("{"), raw.rfind("}")
+        if i == -1 or j == -1:
+            raise ValueError("No JSON object found from Llama.")
+
+        obj = json.loads(raw[i:j+1])
+        top_keywords = [str(x).strip() for x in (obj.get("top_keywords") or []) if str(x).strip()]
+        bottom_keywords = [str(x).strip() for x in (obj.get("bottom_keywords") or []) if str(x).strip()]
+
+        # ensure >= 10 each; pad deterministically if needed
+        if len(top_keywords) < 10 or len(bottom_keywords) < 10:
+            seed_text = "\n\n".join([r["answer"] for r in valid_answers])
+            fb_top, fb_bottom = _fallback_image_keywords_from_text(seed_text)
+            while len(top_keywords) < 10:
+                top_keywords.append(fb_top[len(top_keywords) % len(fb_top)])
+            while len(bottom_keywords) < 10:
+                bottom_keywords.append(fb_bottom[len(bottom_keywords) % len(fb_bottom)])
+
+        print("---------------IMAGE KEYWORDS DONE-----------", int(time.time()))
+        return top_keywords[:30], bottom_keywords[:30]
+
+    except Exception as e:
+        print(f"image keywords (llama) error: {e}")
+        seed_text = "\n\n".join([r["answer"] for r in valid_answers]) if valid_answers else ""
+        return _fallback_image_keywords_from_text(seed_text)
+
+#Generate image keywords
+async def get_keywords(responses):
+    """
+    Async wrapper so keywords are generated concurrently with get_best_answer and get_opinion.
+    Returns: {"top_keywords": [...], "bottom_keywords": [...], "status": "success|failed"}
+    """
+    print("start keywords", int(time.time()))
+    try:
+        top_keywords, bottom_keywords = await asyncio.to_thread(get_image_keywords_from_responses, responses)
+        print("end keywords", int(time.time()))
+        print(top_keywords, bottom_keywords)
+        return {"top_keywords": top_keywords, "bottom_keywords": bottom_keywords, "status": "success"}
+    except Exception as e:
+        print(f"keywords error: {e}")
+        return {"top_keywords": [], "bottom_keywords": [], "status": "failed"}
+
 #Pick best answer and summarize the opinion from answers of each models
 def analyze_result(results, mode):
     loop = asyncio.new_event_loop()
@@ -517,12 +625,13 @@ def analyze_result(results, mode):
     print(results)
     summarize = loop.run_until_complete(asyncio.gather(
         get_best_answer(results),
-        get_opinion(results, mode)
+        get_opinion(results, mode),
+        get_keywords(results)  
     ))
-    best_answer, opinion = summarize
+    best_answer, opinion, keywords = summarize
     loop.close()
     print("\n------------END ANALYZE RESULT------------\n", int(time.time()))
-    return best_answer, opinion
+    return best_answer, opinion, keywords
 
 #Generate answer of user asked(findal_answer: main answer, status_report: AI models success report, opinion: summarized opinion)
 def get_answer(mode, level, history, prompt, question):
@@ -531,10 +640,10 @@ def get_answer(mode, level, history, prompt, question):
         {key: value for key, value in result.items() if key != 'answer'}
         for result in results
     ]
-    best_answer, opinion = analyze_result(results, mode)
+    best_answer, opinion, keywords = analyze_result(results, mode)
 
     if mode == 'consensus':
-        final_answer_with_images = insert_images(best_answer, question)
+        final_answer_with_images = insert_images(best_answer, question, keywords)
     if mode == 'blaze':
         final_answer_with_images = best_answer
 
@@ -568,47 +677,73 @@ def format_bottom_image(img_data):
     </div>
     """
 
-def insert_images(answer_text, query):
+def insert_images(answer_text, query, keywords):
     """
     Insert only 2 relevant images into the answer text:
-    - 1 big image at the top
-    - 1 big centered image at the bottom
+    - 1 big image at the top (from top_keywords candidates)
+    - 1 big centered image at the bottom (from bottom_keywords candidates)
     **Rules**
     - Always insert correct images related to the content
     - 2 images must be different
     """
-    paragraphs = [p.strip() for p in re.split(r'(?<=\n\n)(?=\S)', answer_text) if p.strip()]
+    paragraphs = [p.strip() for p in re.split(r'(?<=\n\n)(?=\S)', answer_text or '') if p.strip()]
     if not paragraphs:
-        return answer_text
+        paragraphs = [answer_text or ""]
 
-    # Fetch top and bottom images
+    # Safely read keyword arrays
+    kw = keywords or {}
+    top_kw = kw.get('top_keywords') or []
+    bottom_kw = kw.get('bottom_keywords') or []
+
+    # Build candidate queries (use a few best items)
+    # Prepend the original query for extra context
+    top_queries = [f"{query} {k}".strip() for k in top_kw][:5]
+    bottom_queries = [f"{query} {k}".strip() for k in bottom_kw][:5]
+
+    if not top_queries and not bottom_queries:
+        # No keywords; just return original text
+        return "\n\n".join(paragraphs)
+
+    # Fetch images concurrently and pick the first valid from each group
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    
     try:
-        # Get two different image queries to increase variety
-        queries = [
-            f"{query} high quality",
-            f"{query} detailed involving all main contents"
-        ]
-        tasks = [fetch_image(q) for q in queries[:2]]
-        images = loop.run_until_complete(asyncio.gather(*tasks))
+        top_tasks = [fetch_image(q) for q in top_queries] if top_queries else []
+        bottom_tasks = [fetch_image(q) for q in bottom_queries] if bottom_queries else []
+
+        top_results, bottom_results = loop.run_until_complete(asyncio.gather(
+            asyncio.gather(*top_tasks) if top_tasks else asyncio.sleep(0, result=[]),
+            asyncio.gather(*bottom_tasks) if bottom_tasks else asyncio.sleep(0, result=[])
+        ))
     finally:
         loop.close()
 
-    # Build the final content with images
+    def first_image(cands):
+        for c in cands:
+            if isinstance(c, dict) and c:
+                return c
+        return None
+
+    top_img = first_image(top_results)
+    bottom_img = first_image(bottom_results)
+
+    # Avoid using the same image twice (compare by URL/thumbnail)
+    if top_img and bottom_img:
+        top_url = top_img.get("thumbnail") or top_img.get("url")
+        bot_url = bottom_img.get("thumbnail") or bottom_img.get("url")
+        if top_url and bot_url and top_url == bot_url:
+            # Try to find a different bottom image
+            bottom_img = first_image([c for c in bottom_results if c and (c.get("thumbnail") or c.get("url")) != top_url])
+
+    # Build the final content
     results = []
-    
-    # Insert top image if available
-    if images and len(images) > 0 and images[0]:
-        results.append(format_top_image(images[0]))
-    
-    # Add all paragraphs
+    if top_img:
+        results.append(format_top_image(top_img))
+
     results.extend(paragraphs)
-    
-    # Insert bottom image if available
-    if images and len(images) > 1 and images[1]:
-        results.append(format_bottom_image(images[1]))
+
+    if bottom_img:
+        results.append(format_bottom_image(bottom_img))
 
     return "\n\n".join(results)
 
@@ -816,10 +951,10 @@ def get_news(mode, level, query):
         {key: value for key, value in result.items() if key != 'answer'}
         for result in results
     ]
-    best_answer, opinion = analyze_result(results, mode)
+    best_answer, opinion, keywords = analyze_result(results, mode)
 
     if mode == 'consensus':
-        final_answer = insert_images(best_answer, query)
+        final_answer = insert_images(best_answer, query, keywords)
     if mode == 'blaze':
         final_answer = best_answer
     return {
@@ -936,9 +1071,21 @@ def judge_system(mode, question, history = []):
 
         5. **Product Intent Detection**:  
 
-        Determine whether the user is inquiring about a **buyable consumer product** such as clothing, electronics, tools, or household goods.  
-        - If yes, extract the product names mentioned in the query and return them in a list.  
-        - If no products are found, return an empty list `[]`.
+            You MUST extract all explicitly mentioned buyable consumer products and close paraphrases (brand + model/family), including ALL sides of any comparison, “worth buying X if you have Y”, or “X vs Y” constructions.
+            
+            Rules:
+            - Include every product explicitly named or strongly implied as a concrete retail item.
+            - Include all sides of comparisons or conditional questions (e.g., “Is X worth it if I have Y?” → extract both X and Y).
+            - For different types of products (e.g., “X vs Y” → extract both X and Y).
+            - Keep names as they appear (brand + model), but be consistent and concise (e.g., “PlayStation 5”, “Nintendo Switch 2”).
+            - Do NOT include vague categories (e.g., “a console”, “a controller”) unless a specific retail product is named.
+            - Deduplicate. Be case-insensitive.
+
+            Return an array. If none, return [].
+
+            Normalization/Aliases (non-exhaustive examples the model should recognize as the same products):
+            - PlayStation 5 ≡ PS5
+            - Nintendo Switch 2 ≡ Switch 2, Nintendo Switch (2nd gen)
 
         Return your answer strictly in the following JSON format: {expected_output}
 
@@ -1036,7 +1183,8 @@ GENERAL RULES
 - Ensure all facts are **100% correct**.  
 - Always include the **latest events, changes, or updates** relevant to the question.  
 - If something is uncertain or context-dependent, explain the possible cases and give practical recommendations.  
-
+- Always observe and analyze all relevant issues from the perspective of the current moment, ensuring that the information reflects the most up-to-date context available at the time of answering.
+- If possible, provide final conclusions or recommendations based on the information provided.
 =========================
 COMPARISON QUESTIONS  
 =========================
@@ -1131,12 +1279,13 @@ CHECKLIST BEFORE FINALIZING
         history = []
     else:
         question = judge_output['updated_question']
-    print("Judge_output")
+    print("Judge_output", len(judge_output['product']))
     print(int(time.time()))
     print(judge_output)
 
     if len(judge_output['product']) > 0:
         if mode == 'consensus':
+            random.shuffle(judge_output['product'])
             judge_output['level'], result = analyze_product(mode, judge_output['level'], judge_output['last_year'], history, prompt, question)
     elif judge_output['last_year'] == 'Yes':
         print("getting news", int(time.time()))
@@ -1205,6 +1354,65 @@ async def get_product(query):
     except Exception as e:
         raise RuntimeError(f"Searching product failed: {str(e)}")
 
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s or "")).strip().lower()
+
+def _product_key(p: dict):
+    """
+    Prefer stable ID; else fallback to normalized title/name.
+    """
+    if isinstance(p, dict):
+        if p.get("id"):
+            return ("id", _norm(p["id"]))
+        title = p.get("title") or p.get("name") or p.get("product")
+        if title:
+            return ("title", _norm(title))
+    # last resort: stable hash of the dict
+    return ("blob", _norm(json.dumps(p, sort_keys=True, ensure_ascii=False)))
+
+def _merge(a: dict, b: dict) -> dict:
+    """
+    Shallow merge: keep existing non-empty values in `a`,
+    fill missing/empty fields from `b`.
+    """
+    out = dict(a)
+    for k, v in b.items():
+        if k not in out or out[k] in (None, "", [], {}):
+            out[k] = v
+    return out
+
+def combine_product_results(product_results):
+    """
+    product_results is typically a list where each item is either:
+      - a list[dict] (preferred), or
+      - a single dict, or
+      - None
+    Returns: list[dict] flattened, deduped, original order preserved.
+    """
+    # 1) Flatten
+    flat = []
+    for chunk in product_results:
+        if not chunk:
+            continue
+        if isinstance(chunk, list):
+            flat.extend([x for x in chunk if x])
+        elif isinstance(chunk, dict):
+            flat.append(chunk)
+        else:
+            # ignore unexpected shapes
+            continue
+
+    # 2) Deduplicate + stable order, merging fields when duplicates appear
+    seen = OrderedDict()
+    for p in flat:
+        key = _product_key(p)
+        if key in seen:
+            seen[key] = _merge(seen[key], p)
+        else:
+            seen[key] = p
+
+    return list(seen.values())
+
 #Generate answer of user asked question and search products mentioned in user asked question.
 #If last_year: Yes, get news and analyze news with AI models 3/5/7. After that combine answer and searched products.
 #IF last_year: No, generate answer with AI models 3/5/7. After that combine answer and searched products.
@@ -1212,16 +1420,23 @@ def compare_product(mode, level, last_year, history, prompt, query, products):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
+    # Kick off product fetches
     product_tasks = [get_product(product) for product in products]
-
     product_results = loop.run_until_complete(asyncio.gather(*product_tasks))
 
     print("--------Product tasks----------")
-    # print(product_results)
-    prompt = prompt.replace("---PRODUCTS---", json.dumps(product_results))
+    # Combine ALL product results here
+    product_data = combine_product_results(product_results)
+
+    # shuffle product_data
+    random.shuffle(product_data)
+
+    # Inject combined products into the prompt (instead of raw product_results)
+    prompt = prompt.replace("---PRODUCTS---", json.dumps(product_data, ensure_ascii=False))
     print("----------Adjust Prompt-----------")
     print(prompt)
-    # Run generate_answer and all product fetches concurrently
+
+    # Run analysis
     if last_year.lower() == 'yes':
         analyze = loop.run_until_complete(asyncio.gather(
             search_news(mode, level, query),
@@ -1233,26 +1448,17 @@ def compare_product(mode, level, last_year, history, prompt, query, products):
     result = analyze[0]
     loop.close()
 
-    # Flatten product_results (each is a list)
-    print("------------PRODUCT_RESULTS------------")
-    # print(product_results)
-    product_data = product_results[0]
-    print("---------Fianl Product ---data")
-    # print(product_data)
-    # Set correct titles
-    # for i, product in enumerate(product_data):
-    #     product["title"] = products[i]
-
     answer = result["final_answer"]
-    print("----------Products----------")
+
+    print("------------PRODUCT_RESULTS (combined)------------")
     # print(product_data)
+
     result["final_answer"] = json.dumps({
         "answer": answer,
         "products": product_data
-    })
+    }, ensure_ascii=False)
 
     return result
-
 #This function will called if user asked question with products. Generate the answer of user asked question.
 #If user just want only looking products search products and return.
 #If user want product's analyzed data, compared data, review and etc, Combine analyzed data with AI answers and products list.
@@ -1454,7 +1660,7 @@ def search_product(query):
 
     results = results.get("shopping_results", [])
     print("---------Search Shopping Results---------")
-    print(results)
+    print(results[1:5])
     min_price = to_float(info.get('min_price'))
     max_price = to_float(info.get('max_price'))
 
